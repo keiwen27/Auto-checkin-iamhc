@@ -175,12 +175,21 @@ def login(session: requests.Session, turnstile_token: str):
         print("登录失败:", data.get("message", ""))
         return None
 
-    user_data = data.get("data", {})
-    user_id = user_data.get("id")
-    username = user_data.get("username", "")
+    # rc.40+ 响应结构: data = {access_token, token_type, session, user:{id, username, ...}}
+    # 旧版结构: data = {id, username, ...}，两者都兼容
+    payload = data.get("data") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    user_info = payload.get("user") or {}
+    user_id = user_info.get("id") or payload.get("id")
+    username = user_info.get("username") or payload.get("username") or ""
     if not user_id:
-        print("登录成功但未获取到用户 ID")
+        print("登录成功但未获取到用户 ID，响应 data 字段:", list(payload.keys()))
         return None
+
+    access_token = payload.get("access_token") or ""
+    if access_token:
+        session.headers["Authorization"] = f"Bearer {access_token}"
 
     print(f"✅ 登录成功 | 账户: {username} | ID: {user_id}")
     return {"id": user_id, "username": username}
