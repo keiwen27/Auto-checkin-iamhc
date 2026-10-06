@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,sys,time,requests
-from datetime import datetime
+import os, sys, time, shutil, tempfile
 from urllib.parse import quote
+
+import requests
 
 EMAIL         = os.environ.get("EMAIL") or ""
 PASSWORD      = os.environ.get("PASSWORD") or ""
@@ -12,11 +13,79 @@ TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 
 BASE_URL      = "https://api.hcnsec.cn"
 QUOTA_PER_UNIT = 500000 # new-api 默认额度换算比例：500000 quota = 1$
-TURNSTILE_TOKEN = ""    # 该站点暂未开启 turuntile,暂时用不上此参数
 
-def login(session: requests.Session):
+# 站点已开启 Turnstile 人机验证（登录和签到接口都校验，token 单次有效），
+# 用真实 Chrome（经 DrissionPage 接管）打开登录页，托管模式挑战会自动通过并产出 token。
+TOKEN_WAIT_TIMEOUT = 120  # 单次等待 Turnstile 自动通过的秒数
+MAX_SOLVE_RETRIES  = 3    # 获取 token 的最大尝试次数
+
+
+def find_chrome():
+    """按优先级寻找本机 Chrome/Chromium 可执行文件。"""
+    candidates = [
+        os.environ.get("CHROME_PATH"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chrome"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def solve_turnstile_token(purpose=""):
+    """打开登录页等待 Turnstile 自动通过，返回 token。"""
+    from DrissionPage import ChromiumOptions, ChromiumPage
+
+    tag = f"[{purpose}] " if purpose else ""
+    co = ChromiumOptions()
+    co.set_argument("--window-size=1280,800")
+    co.set_argument("--no-sandbox")
+    co.set_argument("--disable-dev-shm-usage")
+    co.set_argument("--disable-gpu")
+    co.set_user_data_path(tempfile.mkdtemp(prefix="dp_profile_"))
+
+    chrome_path = find_chrome()
+    if chrome_path:
+        co.set_browser_path(chrome_path)
+    else:
+        print(f"{tag}未找到 Chrome 路径，尝试使用 DrissionPage 默认配置")
+
+    last_err = ""
+    for attempt in range(1, MAX_SOLVE_RETRIES + 1):
+        try:
+            page = ChromiumPage(co)
+            try:
+                page.get(f"{BASE_URL}/login", timeout=60, retry=1)
+                deadline = time.time() + TOKEN_WAIT_TIMEOUT
+                while time.time() < deadline:
+                    ele = page.ele("@name=cf-turnstile-response", timeout=0)
+                    if ele:
+                        token = ele.attr("value")
+                        if token:
+                            print(f"{tag}✅ Turnstile token 获取成功 (长度 {len(token)})")
+                            return token
+                    time.sleep(2)
+                last_err = "等待超时，控件未返回 token"
+            finally:
+                page.quit()
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        print(f"{tag}第 {attempt}/{MAX_SOLVE_RETRIES} 次获取 Turnstile token 失败: {last_err}")
+        time.sleep(3)
+
+    raise RuntimeError(f"{tag}无法获取 Turnstile token: {last_err}")
+
+
+def login(session: requests.Session, turnstile_token: str):
     """登录并返回用户信息（id + username）。"""
-    login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
+    login_url = f"{BASE_URL}/api/user/login?turnstile={quote(turnstile_token)}"
 
     headers = {
         "Accept": "application/json, text/plain, */*",
@@ -71,9 +140,9 @@ def get_user_info(session: requests.Session, user_id):
     return None
 
 
-def checkin(session: requests.Session, user_id):
+def checkin(session: requests.Session, user_id, turnstile_token: str):
     """执行签到，返回签到响应的完整 JSON。"""
-    url = f"{BASE_URL}/api/user/checkin"
+    url = f"{BASE_URL}/api/user/checkin?turnstile={quote(turnstile_token)}"
 
     headers = {
         "Accept": "application/json, text/plain, */*",
@@ -121,10 +190,16 @@ def main():
         print("请先设置 EMAIL 和 PASSWORD 环境变量（或在脚本中填写默认值）")
         sys.exit(1)
 
-    session = requests.Session()
+    # 第 1 步：获取 Turnstile token 并登录
+    print("=== 第 1 步：获取 Turnstile token（用于登录） ===")
+    try:
+        login_token = solve_turnstile_token("登录")
+    except Exception as e:
+        print("❌", e)
+        sys.exit(1)
 
-    # 登录
-    user = login(session)
+    session = requests.Session()
+    user = login(session, login_token)
     if not user:
         print("\n登录失败，无法继续签到")
         sys.exit(1)
@@ -139,8 +214,16 @@ def main():
         sys.exit(1)
     balance_before = quota_to_dollar(info_before.get("quota", 0))
 
+    # 第 2 步：再获取一个新 token（签到接口同样校验，且 token 一次性有效）
+    print("=== 第 2 步：获取 Turnstile token（用于签到） ===")
+    try:
+        checkin_token = solve_turnstile_token("签到")
+    except Exception as e:
+        print("❌", e)
+        sys.exit(1)
+
     # 签到
-    checkin_data = checkin(session, user_id)
+    checkin_data = checkin(session, user_id, checkin_token)
 
     # 获取签到后余额
     info_after = get_user_info(session, user_id)
