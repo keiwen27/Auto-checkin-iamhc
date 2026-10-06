@@ -6,8 +6,6 @@ from urllib.parse import quote
 
 import requests
 
-EMAIL         = os.environ.get("EMAIL") or ""
-PASSWORD      = os.environ.get("PASSWORD") or ""
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 
@@ -15,10 +13,28 @@ BASE_URL      = "https://api.hcnsec.cn"
 QUOTA_PER_UNIT = 500000 # new-api 默认额度换算比例：500000 quota = 1$
 
 # 站点已开启 Turnstile 人机验证（登录和签到接口都校验，token 单次有效），
-# 用真实 Chrome（经 DrissionPage 接管）打开登录页，托管模式挑战会自动通过并产出 token。
-TOKEN_WAIT_TIMEOUT = 120  # 单次等待 Turnstile 自动通过的秒数
-MAX_SOLVE_RETRIES  = 3    # 获取 token 的最大尝试次数
+# 用真实 Chrome（经 DrissionPage 接管）打开登录页，托管模式挑战会自动通过；
+# 若站点给出交互式复选框（如数据中心 IP），则用 CDP 穿透 shadow root 定位
+# 挑战 iframe 并派发真实鼠标事件点击复选框。
+TOKEN_WAIT_TIMEOUT = 120  # 单次等待 Turnstile 通过的秒数
+MAX_SOLVE_RETRIES  = 3    # 单次获取 token 的最大尝试次数
+MAX_ACCOUNTS       = 9    # 最多支持 EMAIL9/PASSWORD9
 SHOT_DIR           = "shots"  # 失败时截图保存目录（CI 中作为 artifact 上传）
+
+
+def collect_accounts():
+    """从环境变量收集账户：EMAIL/PASSWORD 为账户1，EMAIL2/PASSWORD2 ... 为附加账户。"""
+    accounts = []
+    email = os.environ.get("EMAIL") or ""
+    password = os.environ.get("PASSWORD") or ""
+    if email and password:
+        accounts.append({"label": "账户1", "email": email, "password": password})
+    for i in range(2, MAX_ACCOUNTS + 1):
+        email = os.environ.get(f"EMAIL{i}") or ""
+        password = os.environ.get(f"PASSWORD{i}") or ""
+        if email and password:
+            accounts.append({"label": f"账户{i}", "email": email, "password": password})
+    return accounts
 
 
 def find_chrome():
@@ -91,30 +107,46 @@ def click_turnstile(page, tag):
         return False
 
 
-def solve_turnstile_token(purpose=""):
-    """打开登录页等待 Turnstile 自动通过；超时则模拟点击复选框，仍失败则截图留存。"""
-    from DrissionPage import ChromiumOptions, ChromiumPage
+class TurnstileSolver:
+    """复用一个真实 Chrome 实例，每次打开登录页获取一个一次性 Turnstile token。"""
 
-    tag = f"[{purpose}] " if purpose else ""
-    co = ChromiumOptions()
-    co.set_argument("--window-size=1280,900")
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--disable-gpu")
-    co.set_user_data_path(tempfile.mkdtemp(prefix="dp_profile_"))
+    def __init__(self):
+        self._page = None
+        self._profile = tempfile.mkdtemp(prefix="dp_profile_")
+        os.makedirs(SHOT_DIR, exist_ok=True)
 
-    chrome_path = find_chrome()
-    if chrome_path:
-        co.set_browser_path(chrome_path)
-    else:
-        print(f"{tag}未找到 Chrome 路径，尝试使用 DrissionPage 默认配置")
+    def _launch(self):
+        from DrissionPage import ChromiumOptions, ChromiumPage
 
-    os.makedirs(SHOT_DIR, exist_ok=True)
-    last_err = ""
-    for attempt in range(1, MAX_SOLVE_RETRIES + 1):
+        co = ChromiumOptions()
+        co.set_argument("--window-size=1280,900")
+        co.set_argument("--no-sandbox")
+        co.set_argument("--disable-dev-shm-usage")
+        co.set_argument("--disable-gpu")
+        co.set_user_data_path(self._profile)
+
+        chrome_path = find_chrome()
+        if chrome_path:
+            co.set_browser_path(chrome_path)
+        else:
+            print("未找到 Chrome 路径，尝试使用 DrissionPage 默认配置", flush=True)
+        self._page = ChromiumPage(co)
+
+    def _shot(self, name):
         try:
-            page = ChromiumPage(co)
+            if self._page is not None:
+                self._page.get_screenshot(path=SHOT_DIR, name=name)
+        except Exception:
+            pass
+
+    def get_token(self, purpose=""):
+        tag = f"[{purpose}] " if purpose else ""
+        last_err = ""
+        for attempt in range(1, MAX_SOLVE_RETRIES + 1):
             try:
+                if self._page is None:
+                    self._launch()
+                page = self._page
                 page.get(f"{BASE_URL}/login", timeout=60, retry=1)
                 deadline = time.time() + TOKEN_WAIT_TIMEOUT
                 next_click = time.time() + 25  # 先等自动通过，25 秒后开始尝试点击
@@ -126,28 +158,31 @@ def solve_turnstile_token(purpose=""):
                         if token:
                             print(f"{tag}✅ Turnstile token 获取成功 (长度 {len(token)})", flush=True)
                             return token
-                    now = time.time()
-                    if now >= next_click:
+                    if time.time() >= next_click:
                         clicked += 1
-                        next_click = now + 20
+                        next_click = time.time() + 20
                         click_turnstile(page, tag)
                     time.sleep(2)
                 last_err = f"等待超时，控件未返回 token（已点击 {clicked} 次）"
-            finally:
-                try:
-                    page.get_screenshot(path=SHOT_DIR, name=f"{purpose or 'solve'}_attempt{attempt}.png")
-                except Exception:
-                    pass
-                page.quit()
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-        print(f"{tag}第 {attempt}/{MAX_SOLVE_RETRIES} 次获取 Turnstile token 失败: {last_err}", flush=True)
-        time.sleep(3)
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                self.close()  # 浏览器可能已异常，下次重试时重建
+            self._shot(f"{purpose or 'solve'}_attempt{attempt}.png")
+            print(f"{tag}第 {attempt}/{MAX_SOLVE_RETRIES} 次获取 Turnstile token 失败: {last_err}", flush=True)
+            time.sleep(3)
 
-    raise RuntimeError(f"{tag}无法获取 Turnstile token: {last_err}")
+        raise RuntimeError(f"{tag}无法获取 Turnstile token: {last_err}")
+
+    def close(self):
+        try:
+            if self._page is not None:
+                self._page.quit()
+        except Exception:
+            pass
+        self._page = None
 
 
-def login(session: requests.Session, turnstile_token: str):
+def login(session: requests.Session, account, turnstile_token: str):
     """登录并返回用户信息（id + username）。"""
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(turnstile_token)}"
 
@@ -162,17 +197,17 @@ def login(session: requests.Session, turnstile_token: str):
     resp = session.post(
         login_url,
         headers=headers,
-        json={"username": EMAIL, "password": PASSWORD},
+        json={"username": account["email"], "password": account["password"]},
         timeout=20,
     )
 
     if resp.status_code != 200:
-        print("登录请求失败:", resp.status_code)
+        print(f"{account['label']} 登录请求失败: {resp.status_code}", flush=True)
         return None
 
     data = resp.json()
     if not data.get("success"):
-        print("登录失败:", data.get("message", ""))
+        print(f"{account['label']} 登录失败: {data.get('message', '')}", flush=True)
         return None
 
     # rc.40+ 响应结构: data = {access_token, token_type, session, user:{id, username, ...}}
@@ -184,14 +219,14 @@ def login(session: requests.Session, turnstile_token: str):
     user_id = user_info.get("id") or payload.get("id")
     username = user_info.get("username") or payload.get("username") or ""
     if not user_id:
-        print("登录成功但未获取到用户 ID，响应 data 字段:", list(payload.keys()))
+        print(f"{account['label']} 登录成功但未获取到用户 ID，响应 data 字段: {list(payload.keys())}", flush=True)
         return None
 
     access_token = payload.get("access_token") or ""
     if access_token:
         session.headers["Authorization"] = f"Bearer {access_token}"
 
-    print(f"✅ 登录成功 | 账户: {username} | ID: {user_id}")
+    print(f"✅ {account['label']} 登录成功 | 账户: {username} | ID: {user_id}", flush=True)
     return {"id": user_id, "username": username}
 
 
@@ -236,9 +271,9 @@ def quota_to_dollar(quota):
 
 
 def send_notification(message):
-    print("\n" + "=" * 25)
-    print(message)
-    print("=" * 25)
+    print("\n" + "=" * 25, flush=True)
+    print(message, flush=True)
+    print("=" * 25, flush=True)
 
     if TG_BOT_TOKEN and TG_CHAT_ID:
         try:
@@ -249,110 +284,115 @@ def send_notification(message):
                 timeout=10,
             )
             if resp.status_code == 200:
-                print("Telegram 通知发送成功")
+                print("Telegram 通知发送成功", flush=True)
             else:
-                print(f"Telegram 通知发送失败: {resp.status_code} {resp.text}")
+                print(f"Telegram 通知发送失败: {resp.status_code} {resp.text}", flush=True)
         except Exception as e:
-            print("Telegram 通知发送失败:", e)
+            print("Telegram 通知发送失败:", e, flush=True)
     else:
-        print("未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过 Telegram 推送")
+        print("未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过 Telegram 推送", flush=True)
 
 
-def main():
-    if not EMAIL or not PASSWORD:
-        print("请先设置 EMAIL 和 PASSWORD 环境变量（或在脚本中填写默认值）")
-        sys.exit(1)
-
-    # 第 1 步：获取 Turnstile token 并登录
-    print("=== 第 1 步：获取 Turnstile token（用于登录） ===")
-    try:
-        login_token = solve_turnstile_token("登录")
-    except Exception as e:
-        print("❌", e)
-        sys.exit(1)
-
-    session = requests.Session()
-    user = login(session, login_token)
-    if not user:
-        print("\n登录失败，无法继续签到")
-        sys.exit(1)
-
-    user_id = user["id"]
-    username = user.get("username", str(user_id))
-
-    # 获取签到前余额
-    info_before = get_user_info(session, user_id)
-    if not info_before:
-        print("获取用户信息失败")
-        sys.exit(1)
-    balance_before = quota_to_dollar(info_before.get("quota", 0))
-
-    # 第 2 步：再获取一个新 token（签到接口同样校验，且 token 一次性有效）
-    print("=== 第 2 步：获取 Turnstile token（用于签到） ===")
-    try:
-        checkin_token = solve_turnstile_token("签到")
-    except Exception as e:
-        print("❌", e)
-        sys.exit(1)
-
-    # 签到
-    checkin_data = checkin(session, user_id, checkin_token)
-
-    # 获取签到后余额
-    info_after = get_user_info(session, user_id)
-    if not info_after:
-        print("获取签到后用户信息失败")
-        sys.exit(1)
-    balance_after = quota_to_dollar(info_after.get("quota", 0))
-
-    # 判断签到结果
+def process_account(account, solver):
+    """处理单个账户：登录 → 签到 → 通知。返回是否成功。"""
+    label = account["label"]
+    tag = f"[{label}] "
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+
+    # 每个账户使用独立的 Session，避免 Cookie 串号
+    session = requests.Session()
+    try:
+        print(f"=== {label}：获取 Turnstile token（用于登录） ===", flush=True)
+        login_token = solver.get_token(f"{label}-登录")
+
+        user = login(session, account, login_token)
+        if not user:
+            raise RuntimeError("登录失败")
+        user_id = user["id"]
+        username = user.get("username", str(user_id))
+
+        info_before = get_user_info(session, user_id)
+        if not info_before:
+            raise RuntimeError("获取用户信息失败")
+        balance_before = quota_to_dollar(info_before.get("quota", 0))
+
+        print(f"=== {label}：获取 Turnstile token（用于签到） ===", flush=True)
+        checkin_token = solver.get_token(f"{label}-签到")
+
+        checkin_data = checkin(session, user_id, checkin_token)
+
+        info_after = get_user_info(session, user_id)
+        if not info_after:
+            raise RuntimeError("获取签到后用户信息失败")
+        balance_after = quota_to_dollar(info_after.get("quota", 0))
+    except Exception as e:
+        print(f"{tag}❌ 处理失败: {e}", flush=True)
+        send_notification(
+            f"🎁 iamhc 签到通知\n\n"
+            f"❌ {label} 签到异常: {e}\n"
+            f"⏱️ 时间: {now}"
+        )
+        return False
+
     success = checkin_data.get("success", False)
     msg = str(checkin_data.get("message", ""))
 
     if success:
-        # 签到成功
         awarded_data = checkin_data.get("data", {})
-        awarded_quota = awarded_data.get("quota_awarded", 0)
+        awarded_quota = awarded_data.get("quota_awarded", 0) if isinstance(awarded_data, dict) else 0
         awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
-        print(f"✅ 签到成功 | 获得: {awarded_dollar}$")
-
+        print(f"{tag}✅ 签到成功 | 获得: {awarded_dollar}$", flush=True)
         message = (
             f"🎁 iamhc 签到通知\n\n"
-            f"✅ 签到成功,本次签到获得{awarded_dollar}$\n"
-            f"👤 登录账户: {username}\n"
+            f"✅ {label}({username}) 签到成功,本次签到获得{awarded_dollar}$\n"
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
         )
     elif "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
-        # 今日已签到
-        print(f"✅ 今日已签到 | 当前余额: {balance_after}$")
-
+        print(f"{tag}✅ 今日已签到 | 当前余额: {balance_after}$", flush=True)
         message = (
             f"🎁 iamhc 签到通知\n\n"
-            f"✅ 今日你已经签到过了！\n"
-            f"👤 登录账户: {username}\n"
+            f"✅ {label}({username}) 今日你已经签到过了！\n"
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
         )
     else:
-        # 签到失败
-        print(f"❌ 签到失败 | {msg}")
-
+        print(f"{tag}❌ 签到失败 | {msg}", flush=True)
         message = (
             f"🎁 iamhc 签到通知\n\n"
-            f"❌ 签到失败: {msg}\n"
-            f"👤 登录账户: {username}\n"
+            f"❌ {label}({username}) 签到失败: {msg}\n"
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
         )
 
-    # 发送通知
     send_notification(message)
+    return success or ("已签到" in msg or "重复签到" in msg or "今天已签到" in msg)
+
+
+def main():
+    accounts = collect_accounts()
+    if not accounts:
+        print("未配置任何账户：请设置 EMAIL/PASSWORD（附加账户用 EMAIL2/PASSWORD2、EMAIL3/PASSWORD3 ...）")
+        sys.exit(1)
+
+    print(f"共配置 {len(accounts)} 个账户", flush=True)
+    solver = TurnstileSolver()
+    failed = []
+    try:
+        for account in accounts:
+            if not process_account(account, solver):
+                failed.append(account["label"])
+    finally:
+        solver.close()
+
+    if failed:
+        print(f"❌ {len(failed)}/{len(accounts)} 个账户处理失败: {', '.join(failed)}")
+        sys.exit(1)
+    print(f"✅ 全部 {len(accounts)} 个账户处理完成")
 
 
 if __name__ == "__main__":
