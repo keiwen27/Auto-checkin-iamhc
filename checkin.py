@@ -40,6 +40,57 @@ def find_chrome():
     return None
 
 
+def click_turnstile(page, tag):
+    """在 Turnstile 复选框位置模拟真实鼠标点击。
+    挑战 iframe 藏在 shadow root 里，常规元素查询不可见，
+    用 CDP pierce 穿透拿到其位置，再派发原始鼠标事件。"""
+    try:
+        doc = page.run_cdp("DOM.getDocument", depth=-1, pierce=True)
+        target = None
+        stack = [doc["root"]]
+        while stack:
+            n = stack.pop()
+            if n.get("nodeName", "").lower() == "iframe":
+                attrs = n.get("attributes", [])
+                ad = {attrs[i]: attrs[i + 1] for i in range(0, len(attrs) - 1, 2)}
+                if "challenges.cloudflare.com" in ad.get("src", ""):
+                    target = n
+                    break
+            stack.extend(n.get("children", []) or [])
+            stack.extend(n.get("shadowRoots", []) or [])
+        if target is None:
+            print(f"{tag}CDP 未找到 Turnstile 挑战 iframe", flush=True)
+            return False
+        box = page.run_cdp("DOM.getBoxModel", nodeId=target["nodeId"])
+        q = box["model"]["content"]
+        xs, ys = q[0::2], q[1::2]
+        left, right, top, bottom = min(xs), max(xs), min(ys), max(ys)
+        sx = page.run_cdp("Runtime.evaluate", expression="window.scrollX")["result"]["value"]
+        sy = page.run_cdp("Runtime.evaluate", expression="window.scrollY")["result"]["value"]
+        if right - left < 10 or bottom - top < 10:
+            print(f"{tag}Turnstile iframe 尺寸异常: {right-left:.0f}x{bottom-top:.0f}", flush=True)
+            return False
+        x, y = left - sx + 25, (top + bottom) / 2 - sy  # 复选框位于 iframe 左侧约 25px、垂直居中
+        print(f"{tag}Turnstile iframe viewport=({x:.0f},{y:.0f}) size={right-left:.0f}x{bottom-top:.0f}", flush=True)
+        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x - 60, y=y + 30)
+        for i in range(1, 9):
+            page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved",
+                         x=x - 60 + i * 7.5, y=y + 30 - i * 3.7)
+            time.sleep(0.03)
+        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+        time.sleep(0.1)
+        page.run_cdp("Input.dispatchMouseEvent", type="mousePressed",
+                     x=x, y=y, button="left", clickCount=1, buttons=1)
+        time.sleep(0.06)
+        page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
+                     x=x, y=y, button="left", clickCount=1)
+        print(f"{tag}已模拟点击 Turnstile 复选框 ({x:.0f},{y:.0f})", flush=True)
+        return True
+    except Exception as e:
+        print(f"{tag}点击异常: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
 def solve_turnstile_token(purpose=""):
     """打开登录页等待 Turnstile 自动通过；超时则模拟点击复选框，仍失败则截图留存。"""
     from DrissionPage import ChromiumOptions, ChromiumPage
@@ -79,20 +130,7 @@ def solve_turnstile_token(purpose=""):
                     if now >= next_click:
                         clicked += 1
                         next_click = now + 20
-                        try:
-                            iframe = page(
-                                'xpath://iframe[contains(@src,"challenges.cloudflare.com")]',
-                                timeout=3,
-                            )
-                            if iframe:
-                                iframe.scroll.to_see()
-                                page.actions.move_to(iframe, offset_x=-125 + (clicked % 2) * 4)
-                                page.actions.click()
-                                print(f"{tag}已尝试点击 Turnstile 复选框 (第 {clicked} 次)", flush=True)
-                            else:
-                                print(f"{tag}页面上未找到 Turnstile iframe", flush=True)
-                        except Exception as ce:
-                            print(f"{tag}点击复选框失败: {type(ce).__name__}: {ce}", flush=True)
+                        click_turnstile(page, tag)
                     time.sleep(2)
                 last_err = f"等待超时，控件未返回 token（已点击 {clicked} 次）"
             finally:
