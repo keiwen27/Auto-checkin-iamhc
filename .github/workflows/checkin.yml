@@ -23,7 +23,17 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests DrissionPage
+
+      - name: Ensure Chrome
+        run: |
+          if ! command -v google-chrome && ! command -v google-chrome-stable && ! command -v chromium && ! command -v chromium-browser; then
+            echo "Chrome not found, installing..."
+            wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get update && sudo apt-get install -y /tmp/chrome.deb
+          else
+            echo "Chrome already installed"
+          fi
 
       - name: Run checkin
         env:
@@ -31,7 +41,7 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python checkin.py
+        run: xvfb-run -a python checkin.py
 
       - name: clear old run jobs
         if: always()
