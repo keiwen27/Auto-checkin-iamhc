@@ -18,6 +18,7 @@ QUOTA_PER_UNIT = 500000 # new-api 默认额度换算比例：500000 quota = 1$
 # 用真实 Chrome（经 DrissionPage 接管）打开登录页，托管模式挑战会自动通过并产出 token。
 TOKEN_WAIT_TIMEOUT = 120  # 单次等待 Turnstile 自动通过的秒数
 MAX_SOLVE_RETRIES  = 3    # 获取 token 的最大尝试次数
+SHOT_DIR           = "shots"  # 失败时截图保存目录（CI 中作为 artifact 上传）
 
 
 def find_chrome():
@@ -40,12 +41,12 @@ def find_chrome():
 
 
 def solve_turnstile_token(purpose=""):
-    """打开登录页等待 Turnstile 自动通过，返回 token。"""
+    """打开登录页等待 Turnstile 自动通过；超时则模拟点击复选框，仍失败则截图留存。"""
     from DrissionPage import ChromiumOptions, ChromiumPage
 
     tag = f"[{purpose}] " if purpose else ""
     co = ChromiumOptions()
-    co.set_argument("--window-size=1280,800")
+    co.set_argument("--window-size=1280,900")
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-dev-shm-usage")
     co.set_argument("--disable-gpu")
@@ -57,6 +58,7 @@ def solve_turnstile_token(purpose=""):
     else:
         print(f"{tag}未找到 Chrome 路径，尝试使用 DrissionPage 默认配置")
 
+    os.makedirs(SHOT_DIR, exist_ok=True)
     last_err = ""
     for attempt in range(1, MAX_SOLVE_RETRIES + 1):
         try:
@@ -64,20 +66,44 @@ def solve_turnstile_token(purpose=""):
             try:
                 page.get(f"{BASE_URL}/login", timeout=60, retry=1)
                 deadline = time.time() + TOKEN_WAIT_TIMEOUT
+                next_click = time.time() + 25  # 先等自动通过，25 秒后开始尝试点击
+                clicked = 0
                 while time.time() < deadline:
                     ele = page.ele("@name=cf-turnstile-response", timeout=0)
                     if ele:
                         token = ele.attr("value")
                         if token:
-                            print(f"{tag}✅ Turnstile token 获取成功 (长度 {len(token)})")
+                            print(f"{tag}✅ Turnstile token 获取成功 (长度 {len(token)})", flush=True)
                             return token
+                    now = time.time()
+                    if now >= next_click:
+                        clicked += 1
+                        next_click = now + 20
+                        try:
+                            iframe = page(
+                                'xpath://iframe[contains(@src,"challenges.cloudflare.com")]',
+                                timeout=3,
+                            )
+                            if iframe:
+                                iframe.scroll.to_see()
+                                page.actions.move_to(iframe, offset_x=-125 + (clicked % 2) * 4)
+                                page.actions.click()
+                                print(f"{tag}已尝试点击 Turnstile 复选框 (第 {clicked} 次)", flush=True)
+                            else:
+                                print(f"{tag}页面上未找到 Turnstile iframe", flush=True)
+                        except Exception as ce:
+                            print(f"{tag}点击复选框失败: {type(ce).__name__}: {ce}", flush=True)
                     time.sleep(2)
-                last_err = "等待超时，控件未返回 token"
+                last_err = f"等待超时，控件未返回 token（已点击 {clicked} 次）"
             finally:
+                try:
+                    page.get_screenshot(path=SHOT_DIR, name=f"{purpose or 'solve'}_attempt{attempt}.png")
+                except Exception:
+                    pass
                 page.quit()
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-        print(f"{tag}第 {attempt}/{MAX_SOLVE_RETRIES} 次获取 Turnstile token 失败: {last_err}")
+        print(f"{tag}第 {attempt}/{MAX_SOLVE_RETRIES} 次获取 Turnstile token 失败: {last_err}", flush=True)
         time.sleep(3)
 
     raise RuntimeError(f"{tag}无法获取 Turnstile token: {last_err}")
